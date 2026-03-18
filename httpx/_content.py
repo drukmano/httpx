@@ -39,13 +39,18 @@ class ByteStream(AsyncByteStream, SyncByteStream):
         yield self._stream
 
 
-class IteratorByteStream(SyncByteStream):
+class _BaseIteratorByteStream:
     CHUNK_SIZE = 65_536
 
-    def __init__(self, stream: Iterable[bytes]) -> None:
+    def __init__(self, stream: Any, *, _is_generator: bool) -> None:
         self._stream = stream
         self._is_stream_consumed = False
-        self._is_generator = inspect.isgenerator(stream)
+        self._is_generator = _is_generator
+
+
+class IteratorByteStream(_BaseIteratorByteStream, SyncByteStream):
+    def __init__(self, stream: Iterable[bytes]) -> None:
+        super().__init__(stream, _is_generator=inspect.isgenerator(stream))
 
     def __iter__(self) -> Iterator[bytes]:
         if self._is_stream_consumed and self._is_generator:
@@ -64,13 +69,9 @@ class IteratorByteStream(SyncByteStream):
                 yield part
 
 
-class AsyncIteratorByteStream(AsyncByteStream):
-    CHUNK_SIZE = 65_536
-
+class AsyncIteratorByteStream(_BaseIteratorByteStream, AsyncByteStream):
     def __init__(self, stream: AsyncIterable[bytes]) -> None:
-        self._stream = stream
-        self._is_stream_consumed = False
-        self._is_generator = inspect.isasyncgen(stream)
+        super().__init__(stream, _is_generator=inspect.isasyncgen(stream))
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
         if self._is_stream_consumed and self._is_generator:

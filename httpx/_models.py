@@ -3,12 +3,15 @@ from __future__ import annotations
 import codecs
 import datetime
 import email.message
+import inspect
 import json as jsonlib
 import re
 import typing
 import urllib.request
 from collections.abc import Mapping
 from http.cookiejar import Cookie, CookieJar
+
+from quent import Q
 
 from ._content import ByteStream, UnattachedStream, encode_request, encode_response
 from ._decoders import (
@@ -465,33 +468,30 @@ class Request:
             raise RequestNotRead()
         return self._content
 
+    def _do_read(self, content: bytes) -> bytes:
+        self._content = content
+        if not isinstance(self.stream, ByteStream):
+            # If a streaming request has been read entirely into memory, then
+            # we can replace the stream with a raw bytes implementation,
+            # to ensure that any non-replayable streams can still be used.
+            self.stream = ByteStream(content)
+        return self._content
+
     def read(self) -> bytes:
         """
         Read and return the request content.
         """
-        if not hasattr(self, "_content"):
-            assert isinstance(self.stream, typing.Iterable)
-            self._content = b"".join(self.stream)
-            if not isinstance(self.stream, ByteStream):
-                # If a streaming request has been read entirely into memory, then
-                # we can replace the stream with a raw bytes implementation,
-                # to ensure that any non-replayable streams can still be used.
-                self.stream = ByteStream(self._content)
-        return self._content
+        if hasattr(self, "_content"):
+            return self._content
+        return self._do_read(b"".join(self.stream))
 
     async def aread(self) -> bytes:
         """
         Read and return the request content.
         """
-        if not hasattr(self, "_content"):
-            assert isinstance(self.stream, typing.AsyncIterable)
-            self._content = b"".join([part async for part in self.stream])
-            if not isinstance(self.stream, ByteStream):
-                # If a streaming request has been read entirely into memory, then
-                # we can replace the stream with a raw bytes implementation,
-                # to ensure that any non-replayable streams can still be used.
-                self.stream = ByteStream(self._content)
-        return self._content
+        if hasattr(self, "_content"):
+            return self._content
+        return self._do_read(b"".join([part async for part in self.stream]))
 
     def __repr__(self) -> str:
         class_name = self.__class__.__name__
@@ -873,6 +873,86 @@ class Response:
         self.extensions = {}
         self.stream = UnattachedStream()
 
+    def _iter_raw_impl(
+        self,
+        chunk_size: int | None,
+    ) -> typing.Iterable[bytes]:
+        if self.is_stream_consumed:
+            raise StreamConsumed()
+        if self.is_closed:
+            raise StreamClosed()
+
+        self.is_stream_consumed = True
+        self._num_bytes_downloaded = 0
+        chunker = ByteChunker(chunk_size=chunk_size)
+
+        def _track_and_chunk(raw_stream_bytes: bytes) -> typing.Iterable[bytes]:
+            self._num_bytes_downloaded += len(raw_stream_bytes)
+            return chunker.decode(raw_stream_bytes)
+
+        return (
+            Q(lambda: request_context(request=self._request))
+            .with_(lambda _: self.stream)
+            .finally_(lambda _: self._do_close())
+            .flat_iterate(_track_and_chunk, flush=chunker.flush)
+        )
+
+    def _iter_bytes_impl(
+        self,
+        chunk_size: int | None,
+    ) -> typing.Iterable[bytes]:
+        if hasattr(self, "_content"):
+            cs = len(self._content) if chunk_size is None else chunk_size
+            return Q(range(0, len(self._content), max(cs, 1))).iterate(
+                lambda i: self._content[i : i + cs]
+            )
+        decoder = self._get_content_decoder()
+        chunker = ByteChunker(chunk_size=chunk_size)
+
+        def _decode_and_chunk(raw_bytes: bytes) -> typing.Iterable[bytes]:
+            return chunker.decode(decoder.decode(raw_bytes))
+
+        def _flush() -> typing.Iterable[bytes]:
+            decoded = decoder.flush()
+            result = list(chunker.decode(decoded))
+            result.extend(chunker.flush())
+            return result
+
+        return (
+            Q(lambda: request_context(request=self._request))
+            .with_(lambda _: self._iter_raw_impl(chunk_size=None))
+            .flat_iterate(_decode_and_chunk, flush=_flush)
+        )
+
+    def _iter_text_impl(
+        self,
+        chunk_size: int | None,
+    ) -> typing.Iterable[str]:
+        decoder = TextDecoder(encoding=self.encoding or "utf-8")
+        chunker = TextChunker(chunk_size=chunk_size)
+
+        def _decode_and_chunk(byte_content: bytes) -> typing.Iterable[str]:
+            return chunker.decode(decoder.decode(byte_content))
+
+        def _flush() -> typing.Iterable[str]:
+            result = list(chunker.decode(decoder.flush()))
+            result.extend(chunker.flush())
+            return result
+
+        return (
+            Q(lambda: request_context(request=self._request))
+            .with_(lambda _: self._iter_bytes_impl(chunk_size=None))
+            .flat_iterate(_decode_and_chunk, flush=_flush)
+        )
+
+    def _iter_lines_impl(self) -> typing.Iterable[str]:
+        decoder = LineDecoder()
+        return (
+            Q(lambda: request_context(request=self._request))
+            .with_(lambda _: self._iter_text_impl(chunk_size=None))
+            .flat_iterate(decoder.decode, flush=decoder.flush)
+        )
+
     def read(self) -> bytes:
         """
         Read and return the response content.
@@ -880,96 +960,6 @@ class Response:
         if not hasattr(self, "_content"):
             self._content = b"".join(self.iter_bytes())
         return self._content
-
-    def iter_bytes(self, chunk_size: int | None = None) -> typing.Iterator[bytes]:
-        """
-        A byte-iterator over the decoded response content.
-        This allows us to handle gzip, deflate, brotli, and zstd encoded responses.
-        """
-        if hasattr(self, "_content"):
-            chunk_size = len(self._content) if chunk_size is None else chunk_size
-            for i in range(0, len(self._content), max(chunk_size, 1)):
-                yield self._content[i : i + chunk_size]
-        else:
-            decoder = self._get_content_decoder()
-            chunker = ByteChunker(chunk_size=chunk_size)
-            with request_context(request=self._request):
-                for raw_bytes in self.iter_raw():
-                    decoded = decoder.decode(raw_bytes)
-                    for chunk in chunker.decode(decoded):
-                        yield chunk
-                decoded = decoder.flush()
-                for chunk in chunker.decode(decoded):
-                    yield chunk  # pragma: no cover
-                for chunk in chunker.flush():
-                    yield chunk
-
-    def iter_text(self, chunk_size: int | None = None) -> typing.Iterator[str]:
-        """
-        A str-iterator over the decoded response content
-        that handles both gzip, deflate, etc but also detects the content's
-        string encoding.
-        """
-        decoder = TextDecoder(encoding=self.encoding or "utf-8")
-        chunker = TextChunker(chunk_size=chunk_size)
-        with request_context(request=self._request):
-            for byte_content in self.iter_bytes():
-                text_content = decoder.decode(byte_content)
-                for chunk in chunker.decode(text_content):
-                    yield chunk
-            text_content = decoder.flush()
-            for chunk in chunker.decode(text_content):
-                yield chunk  # pragma: no cover
-            for chunk in chunker.flush():
-                yield chunk
-
-    def iter_lines(self) -> typing.Iterator[str]:
-        decoder = LineDecoder()
-        with request_context(request=self._request):
-            for text in self.iter_text():
-                for line in decoder.decode(text):
-                    yield line
-            for line in decoder.flush():
-                yield line
-
-    def iter_raw(self, chunk_size: int | None = None) -> typing.Iterator[bytes]:
-        """
-        A byte-iterator over the raw response content.
-        """
-        if self.is_stream_consumed:
-            raise StreamConsumed()
-        if self.is_closed:
-            raise StreamClosed()
-        if not isinstance(self.stream, SyncByteStream):
-            raise RuntimeError("Attempted to call a sync iterator on an async stream.")
-
-        self.is_stream_consumed = True
-        self._num_bytes_downloaded = 0
-        chunker = ByteChunker(chunk_size=chunk_size)
-
-        with request_context(request=self._request):
-            for raw_stream_bytes in self.stream:
-                self._num_bytes_downloaded += len(raw_stream_bytes)
-                for chunk in chunker.decode(raw_stream_bytes):
-                    yield chunk
-
-        for chunk in chunker.flush():
-            yield chunk
-
-        self.close()
-
-    def close(self) -> None:
-        """
-        Close the response and release the connection.
-        Automatically called if the response body is read to completion.
-        """
-        if not isinstance(self.stream, SyncByteStream):
-            raise RuntimeError("Attempted to call a sync close on an async stream.")
-
-        if not self.is_closed:
-            self.is_closed = True
-            with request_context(request=self._request):
-                self.stream.close()
 
     async def aread(self) -> bytes:
         """
@@ -979,88 +969,86 @@ class Response:
             self._content = b"".join([part async for part in self.aiter_bytes()])
         return self._content
 
-    async def aiter_bytes(
-        self, chunk_size: int | None = None
-    ) -> typing.AsyncIterator[bytes]:
+    def iter_bytes(self, chunk_size: int | None = None) -> typing.Any:
         """
         A byte-iterator over the decoded response content.
         This allows us to handle gzip, deflate, brotli, and zstd encoded responses.
         """
-        if hasattr(self, "_content"):
-            chunk_size = len(self._content) if chunk_size is None else chunk_size
-            for i in range(0, len(self._content), max(chunk_size, 1)):
-                yield self._content[i : i + chunk_size]
-        else:
-            decoder = self._get_content_decoder()
-            chunker = ByteChunker(chunk_size=chunk_size)
-            with request_context(request=self._request):
-                async for raw_bytes in self.aiter_raw():
-                    decoded = decoder.decode(raw_bytes)
-                    for chunk in chunker.decode(decoded):
-                        yield chunk
-                decoded = decoder.flush()
-                for chunk in chunker.decode(decoded):
-                    yield chunk  # pragma: no cover
-                for chunk in chunker.flush():
-                    yield chunk
+        if not isinstance(self.stream, SyncByteStream):
+            raise RuntimeError("Attempted to call a sync iterator on an async stream.")
+        return self._iter_bytes_impl(chunk_size)
 
-    async def aiter_text(
-        self, chunk_size: int | None = None
-    ) -> typing.AsyncIterator[str]:
+    def aiter_bytes(self, chunk_size: int | None = None) -> typing.Any:
+        """
+        A byte-iterator over the decoded response content.
+        This allows us to handle gzip, deflate, brotli, and zstd encoded responses.
+        """
+        if not isinstance(self.stream, AsyncByteStream):
+            raise RuntimeError("Attempted to call an async iterator on a sync stream.")
+        return self._iter_bytes_impl(chunk_size)
+
+    def iter_text(self, chunk_size: int | None = None) -> typing.Any:
         """
         A str-iterator over the decoded response content
         that handles both gzip, deflate, etc but also detects the content's
         string encoding.
         """
-        decoder = TextDecoder(encoding=self.encoding or "utf-8")
-        chunker = TextChunker(chunk_size=chunk_size)
-        with request_context(request=self._request):
-            async for byte_content in self.aiter_bytes():
-                text_content = decoder.decode(byte_content)
-                for chunk in chunker.decode(text_content):
-                    yield chunk
-            text_content = decoder.flush()
-            for chunk in chunker.decode(text_content):
-                yield chunk  # pragma: no cover
-            for chunk in chunker.flush():
-                yield chunk
+        if not isinstance(self.stream, SyncByteStream):
+            raise RuntimeError("Attempted to call a sync iterator on an async stream.")
+        return self._iter_text_impl(chunk_size)
 
-    async def aiter_lines(self) -> typing.AsyncIterator[str]:
-        decoder = LineDecoder()
-        with request_context(request=self._request):
-            async for text in self.aiter_text():
-                for line in decoder.decode(text):
-                    yield line
-            for line in decoder.flush():
-                yield line
+    def aiter_text(self, chunk_size: int | None = None) -> typing.Any:
+        """
+        A str-iterator over the decoded response content
+        that handles both gzip, deflate, etc but also detects the content's
+        string encoding.
+        """
+        if not isinstance(self.stream, AsyncByteStream):
+            raise RuntimeError("Attempted to call an async iterator on a sync stream.")
+        return self._iter_text_impl(chunk_size)
 
-    async def aiter_raw(
-        self, chunk_size: int | None = None
-    ) -> typing.AsyncIterator[bytes]:
+    def iter_lines(self) -> typing.Any:
+        if not isinstance(self.stream, SyncByteStream):
+            raise RuntimeError("Attempted to call a sync iterator on an async stream.")
+        return self._iter_lines_impl()
+
+    def aiter_lines(self) -> typing.Any:
+        if not isinstance(self.stream, AsyncByteStream):
+            raise RuntimeError("Attempted to call an async iterator on a sync stream.")
+        return self._iter_lines_impl()
+
+    def iter_raw(self, chunk_size: int | None = None) -> typing.Any:
         """
         A byte-iterator over the raw response content.
         """
-        if self.is_stream_consumed:
-            raise StreamConsumed()
-        if self.is_closed:
-            raise StreamClosed()
+        if not isinstance(self.stream, SyncByteStream):
+            raise RuntimeError("Attempted to call a sync iterator on an async stream.")
+        return self._iter_raw_impl(chunk_size)
+
+    def aiter_raw(self, chunk_size: int | None = None) -> typing.Any:
+        """
+        A byte-iterator over the raw response content.
+        """
         if not isinstance(self.stream, AsyncByteStream):
             raise RuntimeError("Attempted to call an async iterator on a sync stream.")
+        return self._iter_raw_impl(chunk_size)
 
-        self.is_stream_consumed = True
-        self._num_bytes_downloaded = 0
-        chunker = ByteChunker(chunk_size=chunk_size)
+    def _do_close(self) -> typing.Any:
+        if isinstance(self.stream, SyncByteStream):
+            return self.close()
+        return self.aclose()
 
-        with request_context(request=self._request):
-            async for raw_stream_bytes in self.stream:
-                self._num_bytes_downloaded += len(raw_stream_bytes)
-                for chunk in chunker.decode(raw_stream_bytes):
-                    yield chunk
-
-        for chunk in chunker.flush():
-            yield chunk
-
-        await self.aclose()
+    def close(self) -> typing.Any:
+        """
+        Close the response and release the connection.
+        Automatically called if the response body is read to completion.
+        """
+        if not isinstance(self.stream, SyncByteStream):
+            raise RuntimeError("Attempted to call an sync close on an async stream.")
+        if not self.is_closed:
+            self.is_closed = True
+            with request_context(request=self._request):
+                return self.stream.close()
 
     async def aclose(self) -> None:
         """
@@ -1069,7 +1057,6 @@ class Response:
         """
         if not isinstance(self.stream, AsyncByteStream):
             raise RuntimeError("Attempted to call an async close on a sync stream.")
-
         if not self.is_closed:
             self.is_closed = True
             with request_context(request=self._request):

@@ -27,8 +27,11 @@ client = httpx.Client(transport=transport)
 from __future__ import annotations
 
 import contextlib
+import inspect
 import typing
 from types import TracebackType
+
+from quent import Q
 
 if typing.TYPE_CHECKING:
     import ssl  # pragma: no cover
@@ -55,10 +58,9 @@ from .._exceptions import (
 from .._models import Request, Response
 from .._types import AsyncByteStream, CertTypes, ProxyTypes, SyncByteStream
 from .._urls import URL
-from .base import AsyncBaseTransport, BaseTransport
+from .base import BaseTransport
 
 T = typing.TypeVar("T", bound="HTTPTransport")
-A = typing.TypeVar("A", bound="AsyncHTTPTransport")
 
 SOCKET_OPTION = typing.Union[
     typing.Tuple[int, int, int],
@@ -118,18 +120,34 @@ def map_httpcore_exceptions() -> typing.Iterator[None]:
         raise mapped_exc(message) from exc
 
 
-class ResponseStream(SyncByteStream):
-    def __init__(self, httpcore_stream: typing.Iterable[bytes]) -> None:
+class ResponseStream(SyncByteStream, AsyncByteStream):
+    def __init__(self, httpcore_stream: typing.Any) -> None:
         self._httpcore_stream = httpcore_stream
+        self._iter = (
+            Q(lambda: map_httpcore_exceptions())
+            .with_(lambda _: self._httpcore_stream)
+            .iterate()
+        )
 
     def __iter__(self) -> typing.Iterator[bytes]:
-        with map_httpcore_exceptions():
-            for part in self._httpcore_stream:
-                yield part
+        return iter(self._iter)
 
-    def close(self) -> None:
+    def __aiter__(self) -> typing.AsyncIterator[bytes]:
+        return aiter(self._iter)
+
+    def close(self) -> typing.Any:
+        if hasattr(self._httpcore_stream, "aclose"):
+            return self._httpcore_stream.aclose()
         if hasattr(self._httpcore_stream, "close"):
             self._httpcore_stream.close()
+
+    async def aclose(self) -> None:
+        result = self.close()
+        if inspect.isawaitable(result):
+            await result
+
+
+AsyncResponseStream = ResponseStream
 
 
 class HTTPTransport(BaseTransport):
@@ -146,14 +164,26 @@ class HTTPTransport(BaseTransport):
         local_address: str | None = None,
         retries: int = 0,
         socket_options: typing.Iterable[SOCKET_OPTION] | None = None,
+        _async: bool = False,
     ) -> None:
         import httpcore
+
+        self._is_async = _async
 
         proxy = Proxy(url=proxy) if isinstance(proxy, (str, URL)) else proxy
         ssl_context = create_ssl_context(verify=verify, cert=cert, trust_env=trust_env)
 
+        if _async:
+            pool_cls = httpcore.AsyncConnectionPool
+            http_proxy_cls = httpcore.AsyncHTTPProxy
+            socks_proxy_cls = httpcore.AsyncSOCKSProxy
+        else:
+            pool_cls = httpcore.ConnectionPool
+            http_proxy_cls = httpcore.HTTPProxy
+            socks_proxy_cls = httpcore.SOCKSProxy
+
         if proxy is None:
-            self._pool = httpcore.ConnectionPool(
+            self._pool = pool_cls(
                 ssl_context=ssl_context,
                 max_connections=limits.max_connections,
                 max_keepalive_connections=limits.max_keepalive_connections,
@@ -166,7 +196,7 @@ class HTTPTransport(BaseTransport):
                 socket_options=socket_options,
             )
         elif proxy.url.scheme in ("http", "https"):
-            self._pool = httpcore.HTTPProxy(
+            self._pool = http_proxy_cls(
                 proxy_url=httpcore.URL(
                     scheme=proxy.url.raw_scheme,
                     host=proxy.url.raw_host,
@@ -193,7 +223,7 @@ class HTTPTransport(BaseTransport):
                     "Make sure to install httpx using `pip install httpx[socks]`."
                 ) from None
 
-            self._pool = httpcore.SOCKSProxy(
+            self._pool = socks_proxy_cls(
                 proxy_url=httpcore.URL(
                     scheme=proxy.url.raw_scheme,
                     host=proxy.url.raw_host,
@@ -214,8 +244,34 @@ class HTTPTransport(BaseTransport):
                 f" but got {proxy.url.scheme!r}."
             )
 
+    def _enter_pool(self) -> typing.Any:
+        """Enter the pool. Returns None (sync) or coroutine (async)."""
+        if self._is_async:
+            return self._pool.__aenter__()
+        return self._pool.__enter__()
+
+    def _exit_pool(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> typing.Any:
+        """Exit the pool inside exception mapper. Returns None (sync) or coroutine (async)."""
+        return (
+            Q(lambda: map_httpcore_exceptions())
+            .with_(
+                lambda _: (
+                    self._pool.__aexit__(exc_type, exc_value, traceback)
+                    if self._is_async
+                    else self._pool.__exit__(exc_type, exc_value, traceback)
+                )
+            )
+            .run()
+        )
+
     def __enter__(self: T) -> T:  # Use generics for subclass support.
-        self._pool.__enter__()
+        if not self._is_async:
+            self._enter_pool()
         return self
 
     def __exit__(
@@ -224,142 +280,13 @@ class HTTPTransport(BaseTransport):
         exc_value: BaseException | None = None,
         traceback: TracebackType | None = None,
     ) -> None:
-        with map_httpcore_exceptions():
-            self._pool.__exit__(exc_type, exc_value, traceback)
+        if not self._is_async:
+            self._exit_pool(exc_type, exc_value, traceback)
 
-    def handle_request(
-        self,
-        request: Request,
-    ) -> Response:
-        assert isinstance(request.stream, SyncByteStream)
-        import httpcore
-
-        req = httpcore.Request(
-            method=request.method,
-            url=httpcore.URL(
-                scheme=request.url.raw_scheme,
-                host=request.url.raw_host,
-                port=request.url.port,
-                target=request.url.raw_path,
-            ),
-            headers=request.headers.raw,
-            content=request.stream,
-            extensions=request.extensions,
-        )
-        with map_httpcore_exceptions():
-            resp = self._pool.handle_request(req)
-
-        assert isinstance(resp.stream, typing.Iterable)
-
-        return Response(
-            status_code=resp.status,
-            headers=resp.headers,
-            stream=ResponseStream(resp.stream),
-            extensions=resp.extensions,
-        )
-
-    def close(self) -> None:
-        self._pool.close()
-
-
-class AsyncResponseStream(AsyncByteStream):
-    def __init__(self, httpcore_stream: typing.AsyncIterable[bytes]) -> None:
-        self._httpcore_stream = httpcore_stream
-
-    async def __aiter__(self) -> typing.AsyncIterator[bytes]:
-        with map_httpcore_exceptions():
-            async for part in self._httpcore_stream:
-                yield part
-
-    async def aclose(self) -> None:
-        if hasattr(self._httpcore_stream, "aclose"):
-            await self._httpcore_stream.aclose()
-
-
-class AsyncHTTPTransport(AsyncBaseTransport):
-    def __init__(
-        self,
-        verify: ssl.SSLContext | str | bool = True,
-        cert: CertTypes | None = None,
-        trust_env: bool = True,
-        http1: bool = True,
-        http2: bool = False,
-        limits: Limits = DEFAULT_LIMITS,
-        proxy: ProxyTypes | None = None,
-        uds: str | None = None,
-        local_address: str | None = None,
-        retries: int = 0,
-        socket_options: typing.Iterable[SOCKET_OPTION] | None = None,
-    ) -> None:
-        import httpcore
-
-        proxy = Proxy(url=proxy) if isinstance(proxy, (str, URL)) else proxy
-        ssl_context = create_ssl_context(verify=verify, cert=cert, trust_env=trust_env)
-
-        if proxy is None:
-            self._pool = httpcore.AsyncConnectionPool(
-                ssl_context=ssl_context,
-                max_connections=limits.max_connections,
-                max_keepalive_connections=limits.max_keepalive_connections,
-                keepalive_expiry=limits.keepalive_expiry,
-                http1=http1,
-                http2=http2,
-                uds=uds,
-                local_address=local_address,
-                retries=retries,
-                socket_options=socket_options,
-            )
-        elif proxy.url.scheme in ("http", "https"):
-            self._pool = httpcore.AsyncHTTPProxy(
-                proxy_url=httpcore.URL(
-                    scheme=proxy.url.raw_scheme,
-                    host=proxy.url.raw_host,
-                    port=proxy.url.port,
-                    target=proxy.url.raw_path,
-                ),
-                proxy_auth=proxy.raw_auth,
-                proxy_headers=proxy.headers.raw,
-                proxy_ssl_context=proxy.ssl_context,
-                ssl_context=ssl_context,
-                max_connections=limits.max_connections,
-                max_keepalive_connections=limits.max_keepalive_connections,
-                keepalive_expiry=limits.keepalive_expiry,
-                http1=http1,
-                http2=http2,
-                socket_options=socket_options,
-            )
-        elif proxy.url.scheme in ("socks5", "socks5h"):
-            try:
-                import socksio  # noqa
-            except ImportError:  # pragma: no cover
-                raise ImportError(
-                    "Using SOCKS proxy, but the 'socksio' package is not installed. "
-                    "Make sure to install httpx using `pip install httpx[socks]`."
-                ) from None
-
-            self._pool = httpcore.AsyncSOCKSProxy(
-                proxy_url=httpcore.URL(
-                    scheme=proxy.url.raw_scheme,
-                    host=proxy.url.raw_host,
-                    port=proxy.url.port,
-                    target=proxy.url.raw_path,
-                ),
-                proxy_auth=proxy.raw_auth,
-                ssl_context=ssl_context,
-                max_connections=limits.max_connections,
-                max_keepalive_connections=limits.max_keepalive_connections,
-                keepalive_expiry=limits.keepalive_expiry,
-                http1=http1,
-                http2=http2,
-            )
-        else:  # pragma: no cover
-            raise ValueError(
-                "Proxy protocol must be either 'http', 'https', 'socks5', or 'socks5h',"
-                f" but got {proxy.url.scheme!r}."
-            )
-
-    async def __aenter__(self: A) -> A:  # Use generics for subclass support.
-        await self._pool.__aenter__()
+    async def __aenter__(self: T) -> T:  # Use generics for subclass support.
+        result = self._enter_pool()
+        if inspect.isawaitable(result):
+            await result
         return self
 
     async def __aexit__(
@@ -368,14 +295,20 @@ class AsyncHTTPTransport(AsyncBaseTransport):
         exc_value: BaseException | None = None,
         traceback: TracebackType | None = None,
     ) -> None:
-        with map_httpcore_exceptions():
-            await self._pool.__aexit__(exc_type, exc_value, traceback)
+        result = self._exit_pool(exc_type, exc_value, traceback)
+        if inspect.isawaitable(result):
+            await result
 
-    async def handle_async_request(
+    def _do_handle_request(
         self,
         request: Request,
     ) -> Response:
-        assert isinstance(request.stream, AsyncByteStream)
+        """
+        Shared request handling logic for both sync and async paths.
+        For sync, calls self._pool.handle_request().
+        For async, calls self._pool.handle_async_request().
+        Returns Response directly (sync) or via await (async).
+        """
         import httpcore
 
         req = httpcore.Request(
@@ -390,17 +323,61 @@ class AsyncHTTPTransport(AsyncBaseTransport):
             content=request.stream,
             extensions=request.extensions,
         )
-        with map_httpcore_exceptions():
-            resp = await self._pool.handle_async_request(req)
 
-        assert isinstance(resp.stream, typing.AsyncIterable)
+        return (
+            Q(lambda: map_httpcore_exceptions())
+            .with_(
+                lambda _: (
+                    self._pool.handle_async_request(req)
+                    if self._is_async
+                    else self._pool.handle_request(req)
+                )
+            )
+            .then(lambda resp: self._build_response(resp))
+            .run()
+        )
 
+    def _build_response(self, resp: typing.Any) -> Response:
+        assert isinstance(resp.stream, (typing.Iterable, typing.AsyncIterable))
         return Response(
             status_code=resp.status,
             headers=resp.headers,
-            stream=AsyncResponseStream(resp.stream),
+            stream=ResponseStream(resp.stream),
             extensions=resp.extensions,
         )
 
+    def handle_request(
+        self,
+        request: Request,
+    ) -> Response:
+        assert isinstance(request.stream, SyncByteStream)
+        return self._do_handle_request(request)
+
+    async def handle_async_request(
+        self,
+        request: Request,
+    ) -> Response:
+        assert isinstance(request.stream, AsyncByteStream)
+        return await self._do_handle_request(request)  # type: ignore[misc]
+
+    def _close_pool(self) -> typing.Any:
+        """Close the pool. Returns None (sync) or coroutine (async)."""
+        if self._is_async:
+            return self._pool.aclose()
+        self._pool.close()
+
+    def close(self) -> typing.Any:
+        if self._pool is not None:
+            return self._close_pool()
+
     async def aclose(self) -> None:
-        await self._pool.aclose()
+        result = self.close()
+        if inspect.isawaitable(result):
+            await result
+
+
+class AsyncHTTPTransport(HTTPTransport):
+    """Async variant of HTTPTransport. Equivalent to HTTPTransport(_async=True)."""
+
+    def __init__(self, **kwargs: typing.Any) -> None:
+        super().__init__(_async=True, **kwargs)

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import inspect
 import typing
 from types import TracebackType
 
 from .._models import Request, Response
 
 T = typing.TypeVar("T", bound="BaseTransport")
-A = typing.TypeVar("A", bound="AsyncBaseTransport")
 
 __all__ = ["AsyncBaseTransport", "BaseTransport"]
 
@@ -22,6 +22,19 @@ class BaseTransport:
         traceback: TracebackType | None = None,
     ) -> None:
         self.close()
+
+    async def __aenter__(self: T) -> T:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None = None,
+        exc_value: BaseException | None = None,
+        traceback: TracebackType | None = None,
+    ) -> None:
+        result = self.aclose()
+        if inspect.isawaitable(result):
+            await result
 
     def handle_request(self, request: Request) -> Response:
         """
@@ -58,29 +71,18 @@ class BaseTransport:
             "The 'handle_request' method must be implemented."
         )  # pragma: no cover
 
+    def handle_async_request(self, request: Request) -> Response:
+        """
+        Alias for handle_request, for backward compatibility with the
+        async transport interface.
+        """
+        return self.handle_request(request)
+
     def close(self) -> None:
         pass
 
+    def aclose(self) -> typing.Any:
+        return self.close()
 
-class AsyncBaseTransport:
-    async def __aenter__(self: A) -> A:
-        return self
 
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None = None,
-        exc_value: BaseException | None = None,
-        traceback: TracebackType | None = None,
-    ) -> None:
-        await self.aclose()
-
-    async def handle_async_request(
-        self,
-        request: Request,
-    ) -> Response:
-        raise NotImplementedError(
-            "The 'handle_async_request' method must be implemented."
-        )  # pragma: no cover
-
-    async def aclose(self) -> None:
-        pass
+AsyncBaseTransport = BaseTransport

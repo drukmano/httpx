@@ -4,7 +4,7 @@ import typing
 
 from .._models import Request, Response
 from .._types import AsyncByteStream
-from .base import AsyncBaseTransport
+from .base import BaseTransport
 
 if typing.TYPE_CHECKING:  # pragma: no cover
     import asyncio
@@ -60,7 +60,7 @@ class ASGIResponseStream(AsyncByteStream):
         yield b"".join(self._body)
 
 
-class ASGITransport(AsyncBaseTransport):
+class ASGITransport(BaseTransport):
     """
     A custom AsyncTransport that handles sending requests directly to an ASGI app.
 
